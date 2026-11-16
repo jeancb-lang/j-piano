@@ -192,7 +192,8 @@ input[type=checkbox]{width:22px;height:22px;accent-color:var(--mg)}
     <div class="caldots" id="calDots"></div>
     <div class="calbig"><small>JOUE</small><span id="calNote">DO</span><small id="calHint">le Do du milieu du clavier</small></div>
     <div class="calheard" id="calHeard">J'écoute…</div>
-    <div style="height:10px;border-radius:5px;background:rgba(0,0,0,.45);overflow:hidden;margin:10px 0 16px"><div id="calBar" style="height:100%;width:0;background:linear-gradient(90deg,#2bff9a,#ffd84d,#ff4d6a);transition:width .08s"></div></div>
+    <div style="height:10px;border-radius:5px;background:rgba(0,0,0,.45);overflow:hidden;margin:10px 0 16px;position:relative"><div id="calBar" style="height:100%;width:0;background:linear-gradient(90deg,#2bff9a,#ffd84d,#ff4d6a);transition:width .08s"></div><div id="calTh" style="position:absolute;top:0;bottom:0;width:2px;background:#fff"></div></div>
+    <div class="st" style="text-align:center;margin:-8px 0 14px">La barre doit dépasser le trait blanc quand tu joues.</div>
     <div class="seg"><button id="calSkip">Passer cette note</button><button id="calRedo">↺ Recommencer</button></div>
   </div>
   <div id="calEnd" class="hide2">
@@ -466,7 +467,7 @@ function buildGame(){const S=songList()[cfg.song]||SONGS[0];
 const match=(a,b)=>cfg.oct?(a%12===b%12):a===b;
 function onNote(m,src){
   if(src==='mic'&&cfg.calOct)m-=cfg.calOct;
-  if(CAL&&!CAL.done){calNote(m,src);return}
+  if(CAL&&!CAL.done){if(src!=='mic')calNote(m,src);return}
   if(G&&G.tiles){const c={0:0,2:1,4:2,5:3}[((m%12)+12)%12];if(c!==undefined)tilesTap(c);return}
   if(src!=='touch'&&src!=='key'&&cfg.sndPiano)playNote(m);
   if(!G||G.paused||G.over){lightKey(m,'n');return}
@@ -592,18 +593,29 @@ function autoCorr(buf,sr){let N=buf.length,r1=0,r2=N-1;const th=.2;
   const c=new Float32Array(maxLag+1);for(let l=0;l<=maxLag;l++){let s=0;for(let j=0;j<N-l;j++)s+=b[j]*b[j+l];c[l]=s}
   let d=0;while(d<maxLag&&c[d]>c[d+1])d++;let mv=-1,mp=-1;for(let i=d;i<=maxLag;i++)if(c[i]>mv){mv=c[i];mp=i}
   if(mp<1||mp>=maxLag||mv<c[0]*.3)return -1;const x1=c[mp-1],x2=c[mp],x3=c[mp+1],a=(x1+x3-2*x2)/2,bb=(x3-x1)/2;return sr/(a?mp-bb/(2*a):mp)}
+const NR=[];// historique du niveau (~2,5 s) pour estimer le bruit de fond
 function micTick(){an.getFloatTimeDomainData(micBuf);let rms=0;for(const x of micBuf)rms+=x*x;rms=Math.sqrt(rms/micBuf.length);
-  // bruit de fond appris en continu : le seuil s'adapte à la pièce
-  if(M.noise===undefined)M.noise=rms;else if(rms<M.noise)M.noise=rms;else M.noise+=(rms-M.noise)*.002;
-  const TH=cfg.calTH?Math.max(cfg.calTH,M.noise*2.2):Math.max(.0015+(10-cfg.sens)*.0025,M.noise*2.5);
-  if(CAL&&!CAL.done){CAL.peak=Math.max(CAL.peak,rms);calBar(rms)}
-  diagUpdate(rms,TH);const base=M.ring.length?Math.min(...M.ring):0;M.ring.push(rms);if(M.ring.length>5)M.ring.shift();
-  if(rms<TH*.6){M.last=-1;M.armed=0;return}
-  if(rms>TH&&rms>base*1.6){M.armed=10;M.cand=-1;M.candN=0}
-  if(rms<TH)return;const f=autoCorr(micBuf,actx.sampleRate);if(f<50||f>2200)return;
-  const m=Math.round(69+12*Math.log2(f/440));diagNote(m);if(m===M.cand)M.candN++;else{M.cand=m;M.candN=1}
-  if(M.armed>0){M.armed--;if(M.candN>=2){M.last=m;M.armed=0;onNote(m,'mic')}}
-  else if(m!==M.last&&M.candN>=3){M.last=m;onNote(m,'mic')}}
+  // bruit de fond = niveau le plus bas des 2,5 dernières secondes (ne monte plus quand tu joues)
+  NR.push(rms);if(NR.length>150)NR.shift();let noise=Infinity;for(const v of NR)if(v<noise)noise=v;M.noise=noise;
+  const calib=CAL&&!CAL.done;
+  const TH=calib?Math.max(.0012,noise*2):cfg.calTH?Math.max(cfg.calTH,noise*2):Math.max(.002+(10-cfg.sens)*.0012,noise*2.5);
+  if(calib){CAL.peak=Math.max(CAL.peak,rms);calBar(rms,TH)}
+  diagUpdate(rms,TH);
+  const envPrev=(M.env||0)*.9;M.env=Math.max(rms,envPrev); // enveloppe qui retombe ~ comme un son de piano
+  // énergie des aigus (dérivée du signal) : le coup de marteau la fait bondir, même si la note d'avant résonne
+  let hf=0;for(let i=1;i<micBuf.length;i++){const d=micBuf[i]-micBuf[i-1];hf+=d*d}hf=Math.sqrt(hf/micBuf.length);
+  const hfPrev=(M.hfEnv||0)*.85;M.hfEnv=Math.max(hf,hfPrev);
+  if(rms<TH*.7){M.last=-1;M.armed=0;M.candN=0;return}
+  if(rms>TH&&(rms>envPrev*1.25||hf>hfPrev*1.3)){if(M.armed<=0)M.candN=0;M.armed=12} // nouvelle attaque (même note rejouée)
+  if(rms<TH)return;
+  const f=autoCorr(micBuf,actx.sampleRate);if(f<50||f>2200){if(M.armed>0)M.armed--;return}
+  const m=Math.round(69+12*Math.log2(f/440));diagNote(m);
+  if(calib)calHear(m);
+  if(m===M.cand)M.candN++;else{M.cand=m;M.candN=1}
+  const now=performance.now();
+  const gap=now-(M.lastT||0);
+  if((m!==M.last&&M.candN>=4&&gap>90)||(m===M.last&&M.armed>0&&M.candN>=3&&gap>200)){M.last=m;M.lastT=now;M.armed=0;onNote(m,'mic')}
+  if(M.armed>0)M.armed--}
 
 // ================= ÉCRANS =================
 const $=id=>document.getElementById(id);
@@ -710,20 +722,24 @@ $('tsp').oninput=e=>{cfg.tsp=+e.target.value;$('tspV').textContent=cfg.tsp+'%';s
 // ================= TEST D'ÉCOUTE (calibration) =================
 let CAL=null,calSession=false,calThenPlay=false;
 const CAL_T=[60,62,64,65,67],CAL_HINT=['le Do du milieu du clavier','la touche blanche juste à droite','encore une à droite','la touche blanche après Mi','la touche blanche après Fa'];
-function openCalib(thenPlay){ac();calThenPlay=!!thenPlay;G=null;
-  CAL={targets:CAL_T,i:0,res:[],offs:[],peaks:[],peak:0,done:false,wrong:0};
+function openCalib(thenPlay){ac();calThenPlay=!!thenPlay;G=null;cfg.calOct=0;cfg.calTH=0;
+  CAL={targets:CAL_T,i:0,res:[],offs:[],peaks:[],peak:0,done:false,wrong:0,good:0,bad:{},hold:0};
   $('calEnd').classList.add('hide2');$('calRun').classList.remove('hide2');calInputs();calRender();show('calib')}
 function calInputs(){const any=micOn||midiOn;$('calNoIn').classList.toggle('hide2',any);$('calRun').style.opacity=any?1:.35}
 function calRender(){const C=CAL;
   $('calDots').innerHTML=C.targets.map((t,k)=>`<div class="caldot ${C.res[k]===true?'ok':C.res[k]===false?'ko':k===C.i?'now':''}">${nm(t)}${C.res[k]===true?' ✓':C.res[k]===false?' ✗':''}</div>`).join('');
   if(C.i<C.targets.length){$('calNote').textContent=nm(C.targets[C.i]).toUpperCase();$('calHint').textContent=CAL_HINT[C.i]}}
-function calBar(rms){const el=$('calBar');if(el)el.style.width=Math.min(100,Math.sqrt(rms/.12)*100)+'%'}
+function calBar(rms,TH){const sc=v=>Math.min(100,Math.sqrt(v/.12)*100),el=$('calBar');if(el)el.style.width=sc(rms)+'%';const th=$('calTh');if(th&&TH)th.style.left=sc(TH)+'%'}
+// le micro analyse ~60 images/s : la note est validée dès que la bonne note domine quelques images
+function calHear(m){const C=CAL,t=C.targets[C.i];if(t===undefined||performance.now()<C.hold)return;
+  if(((m-t)%12+12)%12===0){if(++C.good>=4){C.good=0;C.bad={};calNote(m,'mic')}}
+  else{C.bad[m]=(C.bad[m]||0)+1;if(C.bad[m]>=10&&C.good<2){C.bad={};C.good=0;calNote(m,'mic')}}}
 function calNote(m,src){const C=CAL,t=C.targets[C.i];if(t===undefined)return;
   lightKey(m,(m%12)===(t%12)?'ok':'bad');
   if(((m-t)%12+12)%12===0){C.res[C.i]=true;C.offs.push(m-t);C.peaks.push(C.peak||0);C.src=src;
     $('calHeard').innerHTML=`<span style="color:var(--ok)">✓ ${nm(m)}${Math.floor(m/12)-1} reconnu !</span>`;calNext()}
   else{C.wrong++;$('calHeard').innerHTML=`<span style="color:var(--bad)">Entendu : ${nm(m)}${Math.floor(m/12)-1} ✗</span> — rejoue ${nm(t)}`}}
-function calNext(){const C=CAL;C.i++;C.peak=0;calRender();if(C.i>=C.targets.length)setTimeout(calFinish,500)}
+function calNext(){const C=CAL;C.i++;C.peak=0;C.good=0;C.bad={};C.hold=performance.now()+450;calRender();if(C.i>=C.targets.length)setTimeout(calFinish,500)}
 function calFinish(){const C=CAL;C.done=true;calSession=true;const ok=C.res.filter(x=>x===true).length,info=[];
   if(C.src==='mic'){
     // octave : décalage le plus fréquent
