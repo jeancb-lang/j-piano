@@ -5,7 +5,7 @@
 // 3) cherche la note dont la série d'harmoniques explique le mieux ce nouveau son,
 // 4) si on sait quelle note est attendue, vérifie surtout celle-là.
 class NoteDetector{
-  constructor(sr,opt){this.sr=sr;this.P=Object.assign({hop:Math.round(sr/60),onK:1.6,onD:.5,ratio:.62,minIOI:70,anaDelay:2,gate:2.2,fbClar:.93,fbN:6,lo:33,tolK:.004,nWin:600,baseK:1.0,oddK:.15,lowChk:1.0,reK:.2,wd:.86,norm:.5,oct:.9},opt||{});
+  constructor(sr,opt){this.sr=sr;this.P=Object.assign({hop:Math.round(sr/60),onK:1.6,onD:.5,ratio:.62,minIOI:70,anaDelay:2,gate:2.2,fbClar:.93,fbN:6,lo:33,tolK:.004,nWin:600,baseK:1.0,oddK:.15,lowChk:1.0,reK:.08,rePk:.35,reMin:150,wd:.86,norm:.5,oct:.9},opt||{});
     this.N1=2048;this.N2=4096;this.f1=this._fft(this.N1);this.f2=this._fft(this.N2);
     this.w1=this._hann(this.N1);this.w2=this._hann(this.N2);
     this.prevL=[];this.flux=[];this.fluxHist=[];this.spec2=[];this.NR=[];this.pending=[];this.lastOnT=-1e9;this.lastEv=-1;this.lastEvT=-1e9;
@@ -62,7 +62,10 @@ class NoteDetector{
     return {m:best,via:'attaque',conf:1}}
   // même note que la précédente : il faut une vraie nouvelle frappe (l'énergie de la note remonte nettement)
   _restrike(D,base,m,t){if(!this.P.reK||((m-this.lastEv)%12+12)%12!==0||t-this.lastEvT>1500)return true;
-    const nb=this._sal(base,m);return nb<=0||this._sal(D,m)>=this.P.reK*nb}
+    if(t-this.lastEvT<this.P.reMin)return false;
+    const cur=this.spec2[this.spec2.length-1],sc=this._sal(cur,m),nb=this._sal(base,m);
+    // vraie nouvelle frappe : l'énergie de la note revient près de celle de la frappe précédente, et elle augmente
+    return sc>=this.P.rePk*(this.lastPk||0)&&(nb<=0||this._sal(D,m)>=this.P.reK*nb)}
   process(x,t,o){o=o||{};const ev=[];this.fr++;
     // niveau et bruit de fond
     let rms=0;for(let i=x.length-2048;i<x.length;i++)rms+=x[i]*x[i];rms=Math.sqrt(rms/2048);
@@ -81,12 +84,13 @@ class NoteDetector{
     // pic de flux à l'image précédente = attaque
     const [a,b,c]=this.flux.length===3?this.flux:[0,0,0];
     const thr=med*this.P.onK+this.P.onD;
-    if(b>thr&&b>=a&&b>c&&rms>TH*.8&&t-this.lastOnT>this.P.minIOI){this.lastOnT=t;
+    // attaque ; une attaque nettement plus forte juste après une fausse (bruit) passe quand même
+    if(b>thr&&b>=a&&b>c&&rms>TH*.8&&(t-this.lastOnT>this.P.minIOI||b>1.4*(this.lastOnF||0))){this.lastOnT=t;this.lastOnF=b;
       const base=this.spec2[Math.max(0,this.spec2.length-1-(1+this.P.anaDelay+1))];
       this.pending.push({due:this.fr+this.P.anaDelay,base,t})}
     // analyse des attaques en attente
     for(let i=this.pending.length-1;i>=0;i--){const p=this.pending[i];if(this.fr<p.due)continue;this.pending.splice(i,1);
-      const r=this._analyse(p,o);if(r){ev.push(r);this.lastEv=r.m;this.lastEvT=t}}
+      const r=this._analyse(p,o);if(r){ev.push(r);this.lastEv=r.m;this.lastEvT=t;this.lastPk=this._sal(this.spec2[this.spec2.length-1],r.m)}}
     // secours : note tenue sans attaque nette (MPM stable)
     if(rms>TH*1.5&&!this.pending.length){const q=this._mpm(x);
       if(q&&q.clar>this.P.fbClar){const m=Math.round(q.m);if(m===this.cand)this.candN++;else{this.cand=m;this.candN=1}
@@ -95,7 +99,9 @@ class NoteDetector{
           ev.push({m:mm,via:'tenue',conf:q.clar});this.lastEv=m;this.lastEvT=t}}
       else this.candN=0}
     else if(rms<TH)this.candN=0;
-    return {events:ev,rms,TH}}
+    // niveau de chaque note tenue (pour savoir si la touche est encore enfoncée)
+    let hold=null;if(o.hold&&o.hold.length){const cur=this.spec2[this.spec2.length-1];hold=o.hold.map(m=>this._sal(cur,m))}
+    return {events:ev,rms,TH,hold}}
 }
 /*DET-END*/
 if(typeof module!=='undefined')module.exports={NoteDetector};

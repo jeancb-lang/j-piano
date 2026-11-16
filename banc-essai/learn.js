@@ -3,8 +3,9 @@ const {scenarios,render,SR,HOP}=require('./bench');const {audioFor}=require('./c
 const mod=require(process.argv[2]||'./det_new');const Det=mod.NoteDetector;
 const params=process.argv[3]?JSON.parse(process.argv[3]):{};const octFree=!!params.octFree;
 class D2 extends Det{constructor(sr){super(sr,params)}}
-function game(audio,played,expectedSeq){const d=new D2(SR),fr=d.N2;let ptr=0;const st={ok:0,miss:0,wrongFlag:0,falseAcc:0,lat:0};
-  for(let end=fr;end<=audio.length;end+=HOP){const t=end/SR*1000;
+const SRX=+(process.env.SR||SR);function rs(a){if(SRX===SR)return a;const r=SR/SRX,o=new Float32Array(Math.floor(a.length/r));for(let i=0;i<o.length;i++){const x=i*r,j=Math.floor(x),f=x-j;o[i]=a[j]*(1-f)+(a[j+1]||0)*f}return o}
+function game(audio0,played,expectedSeq){const audio=rs(audio0);const d=new D2(SRX),fr=d.N2;const HOPX=Math.round(HOP*SRX/SR);let ptr=0;const st={ok:0,miss:0,wrongFlag:0,falseAcc:0,lat:0};
+  for(let end=fr;end<=audio.length;end+=HOPX){const t=end/SRX*1000;
     while(ptr<played.length-1&&t>played[ptr+1].t*1000-30){st.miss++;ptr++}
     if(ptr>=played.length)break;
     const r=d.process(audio.subarray(end-fr,end),t,{expected:[expectedSeq[ptr]],octFree});
