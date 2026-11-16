@@ -5,7 +5,7 @@
 // 3) cherche la note dont la série d'harmoniques explique le mieux ce nouveau son,
 // 4) si on sait quelle note est attendue, vérifie surtout celle-là.
 class NoteDetector{
-  constructor(sr,opt){this.sr=sr;this.P=Object.assign({hop:Math.round(sr/60),onK:1.6,onD:.5,ratio:.62,minIOI:70,anaDelay:2,gate:2.2,fbClar:.93,fbN:6,lo:33,tolK:.004,nWin:600,baseK:1.0,oddK:.15,lowChk:1.0,reK:.08,rePk:.35,reMin:150,wd:.86,norm:.5,oct:.9},opt||{});
+  constructor(sr,opt){this.sr=sr;this.P=Object.assign({hop:Math.round(sr/60),onK:1.6,onD:.5,ratio:.62,minIOI:70,anaDelay:2,gate:2.2,fbClar:.93,fbN:6,lo:33,tolK:.004,nWin:600,baseK:1.0,oddK:.15,lowChk:1.0,reK:.08,rePk:.35,reMin:150,fLo:75,harmMin:.4,chordOK:1,famReq:1,wd:.86,norm:.5,oct:.9},opt||{});
     this.N1=2048;this.N2=4096;this.f1=this._fft(this.N1);this.f2=this._fft(this.N2);
     this.w1=this._hann(this.N1);this.w2=this._hann(this.N2);
     this.prevL=[];this.flux=[];this.fluxHist=[];this.spec2=[];this.NR=[];this.pending=[];this.lastOnT=-1e9;this.lastEv=-1;this.lastEvT=-1e9;
@@ -40,26 +40,39 @@ class NoteDetector{
     for(let h=1;h<=8;h++){const k=h*f*Math.sqrt(1+B*h*h)/bh;if(k>=this.kmax)break;const tol=Math.max(.6,k*this.P.tolK);let v=0;
       for(let j=Math.max(1,Math.round(k-tol));j<=Math.round(k+tol);j++)if(D[j]>v)v=D[j];if(h&1)od+=v;else ev+=v}
     return {od,ev}}
+  _harm(D,m){const f=440*Math.pow(2,(m-69)/12),bh=this.bin2,B=1.2e-4*Math.pow(2,(m-60)/18),k0=Math.ceil(this.P.fLo/bh),k1=Math.min(this.kmax,Math.floor(4000/bh));
+    let tot=0;for(let k=k0;k<=k1;k++)tot+=D[k];if(tot<=0)return 0;let ex=0,cov=0;const used=new Uint8Array(k1+2);
+    for(let h=1;h<=30;h++){const k=h*f*Math.sqrt(1+B*h*h)/bh;if(k>k1)break;const tol=Math.max(.6,k*this.P.tolK);
+      for(let j=Math.max(k0,Math.round(k-tol));j<=Math.min(k1,Math.round(k+tol));j++)if(!used[j]){used[j]=1;ex+=D[j];cov++}}
+    const frac=ex/tot,base=cov/(k1-k0+1);return base>=1?0:(frac-base)/(1-base)} // 0 = comme du bruit, 1 = toute l'énergie sur les harmoniques
   _real(D,m){const q=this._oe(D,m);return q.od>=this.P.oddK*q.ev} // la note a bien ses harmoniques impaires
   _analyse(pend,o){const D=this._D||(this._D=new Float32Array(this.N2/2)),cur=this.spec2[this.spec2.length-1],base=pend.base;
-    for(let k=0;k<this.N2/2;k++){const d=cur[k]-this.P.baseK*base[k];D[k]=d>0?d:0}
+    const k0=Math.ceil(this.P.fLo/this.bin2);for(let k=0;k<this.N2/2;k++){const d=cur[k]-this.P.baseK*base[k];D[k]=(d>0&&k>=k0)?d:0}
     const lo=o.lo||this.P.lo,hi=o.hi||100;let best=-1,bs=0;const S=new Float32Array(hi+13);
     for(let m=lo;m<=hi;m++){S[m]=this._sal(D,m);if(S[m]>bs){bs=S[m];best=m}}
     if(bs<=0)return null;
     // erreurs d'octave : préférer la note grave si elle explique aussi bien (fondamentale faible au micro)
     if(best-12>=lo&&S[best-12]>this.P.oct*bs&&this._real(D,best-12)){best-=12;bs=S[best]}
     while(best+12<=hi&&!this._real(D,best)&&S[best+12]>.5*bs){best+=12;bs=S[best]}
+    // le son nouveau doit ressembler à une note (énergie concentrée sur ses harmoniques), pas à du bruit
+    // la note la plus présente peut n'être qu'une harmonique (×2, ×3, ×4, ×5) d'une note plus grave qui explique mieux le son
+    {const hb=this._harm(D,best);for(const dn of [12,19,24,28]){const c=best-dn;if(c<lo)break;
+      if(S[c]>=.7*bs&&this._real(D,c)&&this._harm(D,c)>hb+.1){best=c;bs=Math.max(bs,S[c]);break}}}
     const exp=o.expected;
+    if(!(exp&&exp.length)&&this._harm(D,best)<this.P.harmMin)return null;
     if(exp&&exp.length){let pick=null,ps=0;
-      for(const e of exp){const cands=o.octFree?[e-24,e-12,e,e+12,e+24]:[e];
+      const fam=m=>exp.some(e=>o.octFree?((e-m)%12+12)%12===0:e===m);
+      if(this.P.famReq&&!fam(best)&&!(this.P.chordOK&&exp.length>1)){} // la note la plus présente n'est pas demandée : pas de « cible »
+      else for(const e of exp){const cands=o.octFree?[e-12,e,e+12]:[e];
         for(const c of cands){if(c<lo||c>hi)continue;const s=S[c];
           // la note attendue doit dominer ses voisines d'un demi-ton
           const nb=Math.max(S[c-1]||0,S[c+1]||0);
           const okOct=o.octFree||(this._real(D,c)&&!(this.P.lowChk&&c-12>=lo&&this._real(D,c-12)&&S[c-12]>this.P.lowChk*s));
-          if(s>=this.P.ratio*bs&&s>1.25*nb&&okOct&&s>ps){pick=c;ps=s}}}
+          if(s>=this.P.ratio*bs&&s>1.25*nb&&okOct&&this._harm(D,c)>=this.P.harmMin&&s>ps){pick=c;ps=s}}}
       if(pick!==null&&this._restrike(D,base,pick,pend.t))return {m:pick,via:'cible',conf:ps/bs};if(pick!==null)return null}
     if(!this._restrike(D,base,best,pend.t))return null;
-    return {m:best,via:'attaque',conf:1}}
+    const hb=this._harm(D,best);if(hb<this.P.harmMin)return null;
+    return {m:best,via:'attaque',conf:1,h:hb}}
   // même note que la précédente : il faut une vraie nouvelle frappe (l'énergie de la note remonte nettement)
   _restrike(D,base,m,t){if(!this.P.reK||((m-this.lastEv)%12+12)%12!==0||t-this.lastEvT>1500)return true;
     if(t-this.lastEvT<this.P.reMin)return false;
