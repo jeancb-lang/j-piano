@@ -466,7 +466,6 @@ function buildGame(){const S=songList()[cfg.song]||SONGS[0];
     mode:cfg.mode,score:0,combo:0,best:0,hits:0,errors:0,misses:0,perfect:0,start:performance.now(),paused:false,over:false,lastTs:0}}
 const match=(a,b)=>cfg.oct?(a%12===b%12):a===b;
 function onNote(m,src){
-  if(src==='mic'&&cfg.calOct)m-=cfg.calOct;
   if(CAL&&!CAL.done){if(src!=='mic')calNote(m,src);return}
   if(G&&G.tiles){const c={0:0,2:1,4:2,5:3}[((m%12)+12)%12];if(c!==undefined)tilesTap(c);return}
   if(src!=='touch'&&src!=='key'&&cfg.sndPiano)playNote(m);
@@ -576,7 +575,7 @@ async function enableMic(){const st=document.getElementById('inSt');
     try{stream=await navigator.mediaDevices.getUserMedia(opts)}
     catch(e1){if(e1&&e1.name==='InvalidStateError'){setSession('auto');await new Promise(r=>setTimeout(r,300));stream=await navigator.mediaDevices.getUserMedia(opts)}else throw e1}
     if(actx&&actx.state!=='running')await actx.resume();
-    const c=ac();an=c.createAnalyser();an.fftSize=2048;c.createMediaStreamSource(stream).connect(an);micBuf=new Float32Array(an.fftSize);
+    const c=ac();await micAttach(c.createMediaStreamSource(stream));
     micOn=true;st.className='st ok';st.textContent='✓ Micro actif. Regarde la barre de niveau en jouant.';document.getElementById('micBtn').classList.add('on');
     cfg.snd=false;document.getElementById('snd').checked=false;cfg.oct=true;document.getElementById('oct').checked=true;save();
     document.getElementById('diag').classList.remove('hide2')}
@@ -586,36 +585,155 @@ async function enableMic(){const st=document.getElementById('inSt');
       n==='NotFoundError'?"Aucun micro trouvé sur cet appareil.":
       !window.isSecureContext?"Le micro exige une page en https. Ouvre J Piano depuis une adresse https (voir l'aide).":
       "Micro indisponible ("+(n||'erreur')+"). Ouvre J Piano dans Safari ou Chrome."}}
-function autoCorr(buf,sr){let N=buf.length,r1=0,r2=N-1;const th=.2;
-  for(let i=0;i<N/2;i++)if(Math.abs(buf[i])<th){r1=i;break}
-  for(let i=1;i<N/2;i++)if(Math.abs(buf[N-i])<th){r2=N-i;break}
-  const b=buf.subarray(r1,r2);N=b.length;const maxLag=Math.min(N-2,Math.floor(sr/60));if(maxLag<4)return -1;
-  const c=new Float32Array(maxLag+1);for(let l=0;l<=maxLag;l++){let s=0;for(let j=0;j<N-l;j++)s+=b[j]*b[j+l];c[l]=s}
-  let d=0;while(d<maxLag&&c[d]>c[d+1])d++;let mv=-1,mp=-1;for(let i=d;i<=maxLag;i++)if(c[i]>mv){mv=c[i];mp=i}
-  if(mp<1||mp>=maxLag||mv<c[0]*.3)return -1;const x1=c[mp-1],x2=c[mp],x3=c[mp+1],a=(x1+x3-2*x2)/2,bb=(x3-x1)/2;return sr/(a?mp-bb/(2*a):mp)}
-const NR=[];// historique du niveau (~2,5 s) pour estimer le bruit de fond
-function micTick(){an.getFloatTimeDomainData(micBuf);let rms=0;for(const x of micBuf)rms+=x*x;rms=Math.sqrt(rms/micBuf.length);
-  // bruit de fond = niveau le plus bas des 2,5 dernières secondes (ne monte plus quand tu joues)
-  NR.push(rms);if(NR.length>150)NR.shift();let noise=Infinity;for(const v of NR)if(v<noise)noise=v;M.noise=noise;
-  const calib=CAL&&!CAL.done;
-  const TH=calib?Math.max(.0012,noise*2):cfg.calTH?Math.max(cfg.calTH,noise*2):Math.max(.002+(10-cfg.sens)*.0012,noise*2.5);
-  if(calib){CAL.peak=Math.max(CAL.peak,rms);calBar(rms,TH)}
-  diagUpdate(rms,TH);
-  const envPrev=(M.env||0)*.9;M.env=Math.max(rms,envPrev); // enveloppe qui retombe ~ comme un son de piano
-  // énergie des aigus (dérivée du signal) : le coup de marteau la fait bondir, même si la note d'avant résonne
-  let hf=0;for(let i=1;i<micBuf.length;i++){const d=micBuf[i]-micBuf[i-1];hf+=d*d}hf=Math.sqrt(hf/micBuf.length);
-  const hfPrev=(M.hfEnv||0)*.85;M.hfEnv=Math.max(hf,hfPrev);
-  if(rms<TH*.7){M.last=-1;M.armed=0;M.candN=0;return}
-  if(rms>TH&&(rms>envPrev*1.25||hf>hfPrev*1.3)){if(M.armed<=0)M.candN=0;M.armed=12} // nouvelle attaque (même note rejouée)
-  if(rms<TH)return;
-  const f=autoCorr(micBuf,actx.sampleRate);if(f<50||f>2200){if(M.armed>0)M.armed--;return}
-  const m=Math.round(69+12*Math.log2(f/440));diagNote(m);
-  if(calib)calHear(m);
-  if(m===M.cand)M.candN++;else{M.cand=m;M.candN=1}
-  const now=performance.now();
-  const gap=now-(M.lastT||0);
-  if((m!==M.last&&M.candN>=4&&gap>90)||(m===M.last&&M.armed>0&&M.candN>=3&&gap>200)){M.last=m;M.lastT=now;M.armed=0;onNote(m,'mic')}
-  if(M.armed>0)M.armed--}
+/*DET-BEGIN*/
+// ===== Détecteur de notes J Piano =====
+// 1) repère l'ATTAQUE d'une note (flux spectral : énergie qui apparaît d'un coup),
+// 2) regarde quelles fréquences sont NOUVELLES par rapport à juste avant (ignore les notes qui résonnent encore),
+// 3) cherche la note dont la série d'harmoniques explique le mieux ce nouveau son,
+// 4) si on sait quelle note est attendue, vérifie surtout celle-là.
+class NoteDetector{
+  constructor(sr,opt){this.sr=sr;this.P=Object.assign({hop:Math.round(sr/60),onK:1.6,onD:.5,ratio:.62,minIOI:70,anaDelay:2,gate:2.2,fbClar:.93,fbN:6,lo:33,tolK:.004,nWin:600,baseK:1.0,oddK:.15,lowChk:1.0,reK:.2,wd:.86,norm:.5,oct:.9},opt||{});
+    this.N1=2048;this.N2=4096;this.f1=this._fft(this.N1);this.f2=this._fft(this.N2);
+    this.w1=this._hann(this.N1);this.w2=this._hann(this.N2);
+    this.prevL=[];this.flux=[];this.fluxHist=[];this.spec2=[];this.NR=[];this.pending=[];this.lastOnT=-1e9;this.lastEv=-1;this.lastEvT=-1e9;
+    this.cand=-1;this.candN=0;this.fr=0;this.bin2=sr/this.N2;
+    const kmax=Math.floor(5200/this.bin2);this.kmax=kmax}
+  _hann(n){const w=new Float32Array(n);for(let i=0;i<n;i++)w[i]=.5-.5*Math.cos(2*Math.PI*i/(n-1));return w}
+  _fft(n){const lev=Math.log2(n),rev=new Uint32Array(n);for(let i=0;i<n;i++){let r=0;for(let b=0;b<lev;b++)r|=((i>>b)&1)<<(lev-1-b);rev[i]=r}
+    const cs=new Float32Array(n/2),sn=new Float32Array(n/2);for(let i=0;i<n/2;i++){cs[i]=Math.cos(2*Math.PI*i/n);sn[i]=-Math.sin(2*Math.PI*i/n)}
+    return {n,rev,cs,sn,re:new Float32Array(n),im:new Float32Array(n),mag:new Float32Array(n/2)}}
+  _mag(F,x,w){const {n,rev,cs,sn,re,im,mag}=F,off=x.length-n;
+    for(let i=0;i<n;i++){const j=rev[i];re[j]=x[off+i]*w[i];im[j]=0}
+    for(let s=2;s<=n;s<<=1){const h=s>>1,st=n/s;for(let i=0;i<n;i+=s)for(let k=0;k<h;k++){const t=k*st,a=i+k,b=a+h;
+      const tr=re[b]*cs[t]-im[b]*sn[t],ti=re[b]*sn[t]+im[b]*cs[t];re[b]=re[a]-tr;im[b]=im[a]-ti;re[a]+=tr;im[a]+=ti}}
+    for(let k=0;k<n/2;k++)mag[k]=Math.hypot(re[k],im[k]);return mag}
+  // Hauteur "classique" (MPM) pour les notes jouées sans attaque nette
+  _mpm(x){const N=1024,sr=this.sr/2,off=x.length-2048,y=this._ds||(this._ds=new Float32Array(N));
+    for(let i=0;i<N;i++)y[i]=.5*(x[off+2*i]+x[off+2*i+1]);
+    const maxLag=Math.min(N-2,Math.floor(sr/55)),minLag=Math.floor(sr/2300),sq=this._sq||(this._sq=new Float64Array(N+1));
+    for(let i=0;i<N;i++)sq[i+1]=sq[i]+y[i]*y[i];const n=this._ns||(this._ns=new Float32Array(N));
+    for(let t=0;t<=maxLag;t++){let r=0;const L=N-t;for(let j=0;j<L;j++)r+=y[j]*y[j+t];const m=sq[L]+sq[N]-sq[t];n[t]=m>0?2*r/m:0}
+    let t=1;while(t<=maxLag&&n[t]>0)t++;let best=null,g=0;const pk=[];
+    while(t<=maxLag){while(t<=maxLag&&n[t]<=0)t++;let b=-1,bi=-1;while(t<=maxLag&&n[t]>0){if(n[t]>b){b=n[t];bi=t}t++}if(bi>minLag){pk.push([bi,b]);if(b>g)g=b}}
+    for(const p of pk)if(p[1]>=.9*g){best=p;break}if(!best)return null;
+    const i=best[0],a=n[i-1],b=n[i],c=n[i+1],d=a-2*b+c,T=d?i+.5*(a-c)/d:i;return {m:69+12*Math.log2(sr/T/440),clar:best[1]}}
+  // Saillance d'une note dans le spectre "nouveau" D : somme pondérée de ses harmoniques
+  _sal(D,m){const f=440*Math.pow(2,(m-69)/12),bh=this.bin2,P=this.P;let s=0,w=1,ws=0;const B=1.2e-4*Math.pow(2,(m-60)/18);
+    for(let h=1;h<=24;h++){const fh=h*f*Math.sqrt(1+B*h*h),k=fh/bh;if(k>=this.kmax)break;const tol=Math.max(.6,k*P.tolK);
+      let v=0;for(let j=Math.max(1,Math.round(k-tol));j<=Math.round(k+tol);j++)if(D[j]>v)v=D[j];s+=w*v;ws+=w;w*=P.wd}
+    return ws?s/Math.pow(ws,P.norm):0}
+  // énergie aux harmoniques impaires / paires d'une note (distingue une note de son octave)
+  _oe(D,m){const f=440*Math.pow(2,(m-69)/12),bh=this.bin2;let od=0,ev=0;const B=1.2e-4*Math.pow(2,(m-60)/18);
+    for(let h=1;h<=8;h++){const k=h*f*Math.sqrt(1+B*h*h)/bh;if(k>=this.kmax)break;const tol=Math.max(.6,k*this.P.tolK);let v=0;
+      for(let j=Math.max(1,Math.round(k-tol));j<=Math.round(k+tol);j++)if(D[j]>v)v=D[j];if(h&1)od+=v;else ev+=v}
+    return {od,ev}}
+  _real(D,m){const q=this._oe(D,m);return q.od>=this.P.oddK*q.ev} // la note a bien ses harmoniques impaires
+  _analyse(pend,o){const D=this._D||(this._D=new Float32Array(this.N2/2)),cur=this.spec2[this.spec2.length-1],base=pend.base;
+    for(let k=0;k<this.N2/2;k++){const d=cur[k]-this.P.baseK*base[k];D[k]=d>0?d:0}
+    const lo=o.lo||this.P.lo,hi=o.hi||100;let best=-1,bs=0;const S=new Float32Array(hi+13);
+    for(let m=lo;m<=hi;m++){S[m]=this._sal(D,m);if(S[m]>bs){bs=S[m];best=m}}
+    if(bs<=0)return null;
+    // erreurs d'octave : préférer la note grave si elle explique aussi bien (fondamentale faible au micro)
+    if(best-12>=lo&&S[best-12]>this.P.oct*bs&&this._real(D,best-12)){best-=12;bs=S[best]}
+    while(best+12<=hi&&!this._real(D,best)&&S[best+12]>.5*bs){best+=12;bs=S[best]}
+    const exp=o.expected;
+    if(exp&&exp.length){let pick=null,ps=0;
+      for(const e of exp){const cands=o.octFree?[e-24,e-12,e,e+12,e+24]:[e];
+        for(const c of cands){if(c<lo||c>hi)continue;const s=S[c];
+          // la note attendue doit dominer ses voisines d'un demi-ton
+          const nb=Math.max(S[c-1]||0,S[c+1]||0);
+          const okOct=o.octFree||(this._real(D,c)&&!(this.P.lowChk&&c-12>=lo&&this._real(D,c-12)&&S[c-12]>this.P.lowChk*s));
+          if(s>=this.P.ratio*bs&&s>1.25*nb&&okOct&&s>ps){pick=c;ps=s}}}
+      if(pick!==null&&this._restrike(D,base,pick,pend.t))return {m:pick,via:'cible',conf:ps/bs};if(pick!==null)return null}
+    if(!this._restrike(D,base,best,pend.t))return null;
+    return {m:best,via:'attaque',conf:1}}
+  // même note que la précédente : il faut une vraie nouvelle frappe (l'énergie de la note remonte nettement)
+  _restrike(D,base,m,t){if(!this.P.reK||((m-this.lastEv)%12+12)%12!==0||t-this.lastEvT>1500)return true;
+    const nb=this._sal(base,m);return nb<=0||this._sal(D,m)>=this.P.reK*nb}
+  process(x,t,o){o=o||{};const ev=[];this.fr++;
+    // niveau et bruit de fond
+    let rms=0;for(let i=x.length-2048;i<x.length;i++)rms+=x[i]*x[i];rms=Math.sqrt(rms/2048);
+    this.NR.push(rms);if(this.NR.length>this.P.nWin)this.NR.shift();let noise=Infinity;for(const v of this.NR)if(v<noise)noise=v;
+    const TH=Math.max(o.calTH||0,.0009,noise*this.P.gate);this.rms=rms;this.TH=TH;
+    // flux spectral (attaques)
+    const M1=this._mag(this.f1,x,this.w1),L=new Float32Array(M1.length);for(let k=0;k<L.length;k++)L[k]=Math.log1p(M1[k]*400);
+    let fl=0;const p1=this.prevL[this.prevL.length-1],p2=this.prevL[this.prevL.length-2];
+    if(p1){const kx=Math.min(L.length,Math.floor(6000/(this.sr/this.N1)));for(let k=2;k<kx;k++){const r=p2?Math.max(p1[k],p2[k]):p1[k];const d=L[k]-r;if(d>0)fl+=d}}
+    this.prevL.push(L);if(this.prevL.length>3)this.prevL.shift();
+    this.flux.push(fl);if(this.flux.length>3)this.flux.shift();
+    const sorted=this.fluxHist.slice().sort((a,b)=>a-b),med=sorted.length?sorted[sorted.length>>1]:fl;
+    this.fluxHist.push(fl);if(this.fluxHist.length>40)this.fluxHist.shift();
+    // spectre fin (4096) gardé quelques images pour la comparaison avant/après
+    const M2=this._mag(this.f2,x,this.w2);this.spec2.push(Float32Array.from(M2));if(this.spec2.length>8)this.spec2.shift();
+    // pic de flux à l'image précédente = attaque
+    const [a,b,c]=this.flux.length===3?this.flux:[0,0,0];
+    const thr=med*this.P.onK+this.P.onD;
+    if(b>thr&&b>=a&&b>c&&rms>TH*.8&&t-this.lastOnT>this.P.minIOI){this.lastOnT=t;
+      const base=this.spec2[Math.max(0,this.spec2.length-1-(1+this.P.anaDelay+1))];
+      this.pending.push({due:this.fr+this.P.anaDelay,base,t})}
+    // analyse des attaques en attente
+    for(let i=this.pending.length-1;i>=0;i--){const p=this.pending[i];if(this.fr<p.due)continue;this.pending.splice(i,1);
+      const r=this._analyse(p,o);if(r){ev.push(r);this.lastEv=r.m;this.lastEvT=t}}
+    // secours : note tenue sans attaque nette (MPM stable)
+    if(rms>TH*1.5&&!this.pending.length){const q=this._mpm(x);
+      if(q&&q.clar>this.P.fbClar){const m=Math.round(q.m);if(m===this.cand)this.candN++;else{this.cand=m;this.candN=1}
+        if(this.candN===this.P.fbN&&m!==this.lastEv&&t-this.lastEvT>250&&t-this.lastOnT>250){
+          let mm=m;const exp=o.expected;if(exp&&exp.length&&o.octFree){for(const e of exp)if(((e-m)%12+12)%12===0)mm=e}
+          ev.push({m:mm,via:'tenue',conf:q.clar});this.lastEv=m;this.lastEvT=t}}
+      else this.candN=0}
+    else if(rms<TH)this.candN=0;
+    return {events:ev,rms,TH}}
+}
+/*DET-END*/
+// ---- branchement du détecteur sur le micro ----
+let DET=null,micLastProc=0,lastAcceptT=0,micWrongTimer=null;
+function micExpected(){
+  if(CAL&&!CAL.done)return {expected:[CAL.targets[CAL.i]],octFree:true};
+  if(G&&G.tiles){if(G.over||G.paused)return {};const col=tRow(G.hits).col;return {expected:[[60,62,64,65][col]],octFree:true}}
+  if(G&&!G.over&&!G.paused){
+    if(G.mode==='learn'){const s=G.steps[G.step];return s?{expected:s.notes.filter(n=>!n.hit).map(n=>n.m),octFree:cfg.oct}:{}}
+    const bps=G.bpm/60,win=.45*bps;return {expected:G.notes.filter(n=>!n.hit&&!n.miss&&Math.abs(n.t-G.beat)<=win).map(n=>n.m),octFree:cfg.oct}}
+  return {}}
+// Le son du micro arrive par blocs continus (indépendant de l'écran) : aucun morceau n'est perdu si l'affichage ralentit
+// L'écoute tourne dans le fil AUDIO du navigateur (AudioWorklet) : même si l'écran rame, aucun bloc de son n'est perdu.
+// Secours si indisponible : ScriptProcessor.
+let micSP=null,micNode=null,micMode='',micLastCtx='';
+const WORKLET_TAIL=`
+class JPProc extends AudioWorkletProcessor{constructor(){super();this.buf=new Float32Array(4096);this.hop=0;this.det=new NoteDetector(sampleRate);this.ctx={};this.k=0;
+  this.port.onmessage=e=>{this.ctx=e.data;if(e.data.gate)this.det.P.gate=e.data.gate}}
+ process(inputs){const x=inputs[0]&&inputs[0][0];if(!x)return true;const b=this.buf;b.copyWithin(0,x.length);b.set(x,b.length-x.length);this.hop+=x.length;
+  if(this.hop>=1024){this.hop-=1024;const r=this.det.process(b,currentTime*1000,this.ctx);
+   if(r.events.length||(++this.k%3===0))this.port.postMessage({ev:r.events,rms:r.rms,TH:r.TH})}
+  return true}}
+registerProcessor('jp-proc',JPProc);`;
+function micCtx(){const c=micExpected();c.calTH=cfg.calTH||0;c.gate=1.6+(10-cfg.sens)*.2;return c}
+function micSync(){if(!micOn)return;const c=micCtx(),s=JSON.stringify(c);if(s===micLastCtx)return;micLastCtx=s;
+  if(micNode)micNode.port.postMessage(c);else if(DET)DET.P.gate=c.gate}
+async function micAttach(node){const c=actx;micLastCtx='';
+  try{if(micNode){micNode.disconnect();micNode=null}if(micSP){micSP.disconnect();micSP=null}}catch(e){}
+  const z=c.createGain();z.gain.value=0;z.connect(c.destination);
+  try{if(!c.audioWorklet)throw 0;
+    const url=URL.createObjectURL(new Blob([NoteDetector.toString()+WORKLET_TAIL],{type:'application/javascript'}));
+    await c.audioWorklet.addModule(url);micNode=new AudioWorkletNode(c,'jp-proc');
+    micNode.port.onmessage=e=>micMsg(e.data);node.connect(micNode);micNode.connect(z);micMode='worklet'}
+  catch(err){micBuf=new Float32Array(4096);DET=new NoteDetector(c.sampleRate);
+    micSP=c.createScriptProcessor(1024,1,1);node.connect(micSP);micSP.connect(z);micMode='sp';
+    micSP.onaudioprocess=ev=>{const x=ev.inputBuffer.getChannelData(0);micBuf.copyWithin(0,x.length);micBuf.set(x,micBuf.length-x.length);
+      const ctx=micCtx();DET.P.gate=ctx.gate;micMsg(Object.assign({ev:[]},(r=>({ev:r.events,rms:r.rms,TH:r.TH}))(DET.process(micBuf,performance.now(),ctx))))}}
+  micSync()}
+function micTick(){micSync()}
+function micMsg(d){if(CAL&&!CAL.done){CAL.peak=Math.max(CAL.peak,d.rms);calBar(d.rms,d.TH)}
+  diagUpdate(d.rms,d.TH);const ctx=micExpected();
+  for(const e of d.ev){diagNote(e.m);micEvent(e,ctx);micLastCtx='';micSync()}}
+function micEvent(e,ctx){const exp=ctx.expected||[],oct=ctx.octFree;
+  const ok=exp.some(x=>oct?((x-e.m)%12+12)%12===0:x===e.m);
+  if(CAL&&!CAL.done){calNote(e.m,'mic');return}
+  if(G&&G.tiles){if(ok)tilesTap([60,62,64,65].indexOf(exp[0]));return} // au micro, une fausse note ne fait jamais perdre
+  if(ok||!G){lastAcceptT=performance.now();onNote(ok?exp.find(x=>oct?((x-e.m)%12+12)%12===0:x===e.m):e.m,'mic');return}
+  // fausse note : seulement si elle est proche de la note attendue (vraie erreur de touche, pas un bruit de la pièce)
+  if(exp.length&&!exp.some(x=>Math.abs(x-e.m)<=9))return;
+  // puis on attend 300 ms : si la bonne note est validée entre-temps, on ignore (résonances, pédale)
+  const t=performance.now();clearTimeout(micWrongTimer);micWrongTimer=setTimeout(()=>{if(lastAcceptT<t-50)onNote(e.m,'mic')},300)}
 
 // ================= ÉCRANS =================
 const $=id=>document.getElementById(id);
@@ -731,7 +849,7 @@ function calRender(){const C=CAL;
   if(C.i<C.targets.length){$('calNote').textContent=nm(C.targets[C.i]).toUpperCase();$('calHint').textContent=CAL_HINT[C.i]}}
 function calBar(rms,TH){const sc=v=>Math.min(100,Math.sqrt(v/.12)*100),el=$('calBar');if(el)el.style.width=sc(rms)+'%';const th=$('calTh');if(th&&TH)th.style.left=sc(TH)+'%'}
 // le micro analyse ~60 images/s : la note est validée dès que la bonne note domine quelques images
-function calHear(m){const C=CAL,t=C.targets[C.i];if(t===undefined||performance.now()<C.hold)return;
+function calHear_unused(m){const C=CAL,t=C.targets[C.i];if(t===undefined||performance.now()<C.hold)return;
   if(((m-t)%12+12)%12===0){if(++C.good>=4){C.good=0;C.bad={};calNote(m,'mic')}}
   else{C.bad[m]=(C.bad[m]||0)+1;if(C.bad[m]>=10&&C.good<2){C.bad={};C.good=0;calNote(m,'mic')}}}
 function calNote(m,src){const C=CAL,t=C.targets[C.i];if(t===undefined)return;
@@ -744,9 +862,9 @@ function calFinish(){const C=CAL;C.done=true;calSession=true;const ok=C.res.filt
   if(C.src==='mic'){
     // octave : décalage le plus fréquent
     const cnt={};C.offs.forEach(o=>cnt[o]=(cnt[o]||0)+1);const best=+Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a])[0]||0;
-    cfg.calOct=(cfg.calOct||0)+best;if(best)info.push(`Octave corrigée : le micro entendait ${best>0?'+':''}${best/12} octave, c'est compensé.`);
+    cfg.calOct=0; // le détecteur trouve lui-même la bonne octave
     // seuil calé sur la note la plus douce que tu as jouée
-    const pk=C.peaks.filter(x=>x>0);if(pk.length){cfg.calTH=Math.min(.05,Math.max(.0015,Math.min(...pk)*.3));info.push('Sensibilité réglée sur le volume de ton piano dans ta pièce.')}
+    const pk=C.peaks.filter(x=>x>0);if(pk.length){cfg.calTH=Math.min(.03,Math.max(.0009,Math.min(...pk)*.12));info.push('Sensibilité réglée sur le volume de ton piano dans ta pièce.')}
   }else info.push('Piano branché en MIDI : chaque note arrive directement, aucun réglage nécessaire.');
   if(C.wrong>3)info.push(`${C.wrong} fausses détections pendant le test : joue dans une pièce calme, téléphone posé près du piano.`);
   if(ok<5)info.push("Notes ratées : monte le volume du piano, débranche le casque, rapproche le téléphone des haut-parleurs, puis refais le test.");
